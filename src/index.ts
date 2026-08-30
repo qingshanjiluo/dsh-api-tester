@@ -1,3 +1,16 @@
+/**
+ * dsh-api-tester — API测试客户端
+ *
+ * 功能：
+ * 1. HTTP请求
+ * 2. 断言测试
+ * 3. 集合运行
+ * 4. Mock数据
+ *
+ * 工具：api_request, api_test, api_collection_run, api_mock
+ * 命令：/api
+ * 配置：enabled
+ */
 import { existsSync, readFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { z } from 'zod';
