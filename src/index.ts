@@ -182,30 +182,28 @@ export function formatResponseForDisplay(response: Response): string {
   return `Status: ${response.status}\nTime: ${response.timing.toFixed(0)}ms\nBody:\n${preview}`;
 }
 
-export function apply(settings: any) {
-  const config = configSchema.parse(settings);
+export function apply(ctx: any, config?: Config) {
+  const cfg = config || configSchema.parse({});
 
-  settings.tools.api_request = {
-    description: 'Send an HTTP request',
+  ctx.tools.register({
+    name: 'api_request',
+    description: '发送 HTTP 请求',
     parameters: z.object({
       method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
-      url: z.string().describe('The request URL'),
-      headers: z.string().optional().describe('JSON string of headers'),
+      url: z.string(),
+      headers: z.string().optional(),
       body: z.string().optional(),
       timeout: z.number().optional(),
     }),
     execute: async (params: any) => {
       const headers = params.headers ? JSON.parse(params.headers) : {};
-      const response = executeRequest(
-        {
-          method: params.method,
-          url: params.url,
-          headers,
-          body: params.body,
-          timeout: params.timeout,
-        },
-        config
-      );
+      const response = executeRequest({
+        method: params.method,
+        url: params.url,
+        headers,
+        body: params.body,
+        timeout: params.timeout,
+      }, cfg);
 
       return {
         status: response.status,
@@ -214,146 +212,85 @@ export function apply(settings: any) {
         timing: `${response.timing.toFixed(0)}ms`,
       };
     },
-  };
+  });
 
-  settings.tools.api_test = {
-    description: 'Send request and run assertions',
+  ctx.tools.register({
+    name: 'api_test',
+    description: '发送请求并运行断言',
     parameters: z.object({
       method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
       url: z.string(),
       headers: z.string().optional(),
       body: z.string().optional(),
-      assertions: z.string().describe('JSON array of assertions'),
+      assertions: z.string(),
     }),
     execute: async (params: any) => {
       const headers = params.headers ? JSON.parse(params.headers) : {};
       const assertions: Assertion[] = JSON.parse(params.assertions);
-
-      const response = executeRequest(
-        {
-          method: params.method,
-          url: params.url,
-          headers,
-          body: params.body,
-        },
-        config
-      );
-
+      const response = executeRequest({ method: params.method, url: params.url, headers, body: params.body }, cfg);
       const result = runAssertions(response, assertions);
-      return {
-        passed: result.passed,
-        results: result.results,
-        response: formatResponseForDisplay(response),
-      };
+      return { passed: result.passed, results: result.results, response: formatResponseForDisplay(response) };
     },
-  };
+  });
 
-  settings.tools.api_collection_run = {
-    description: 'Run a collection of requests from a JSON file',
+  ctx.tools.register({
+    name: 'api_collection_run',
+    description: '运行请求集合',
     parameters: z.object({
-      file: z.string().describe('Path to collection JSON file'),
-      env: z.string().optional().describe('Environment variables JSON'),
+      file: z.string(),
+      env: z.string().optional(),
     }),
     execute: async (params: any) => {
-      if (!existsSync(params.file)) {
-        return { error: `File not found: ${params.file}` };
-      }
-
+      if (!existsSync(params.file)) return { error: `文件不存在: ${params.file}` };
       const content = readFileSync(params.file, 'utf-8');
       const collection = JSON.parse(content);
       const env = params.env ? JSON.parse(params.env) : {};
       const summary = { total: 0, passed: 0, failed: 0, results: [] as any[] };
-
       for (const req of collection.requests) {
         const url = applyVariables(req.url, env);
         const body = req.body ? applyVariables(req.body, env) : undefined;
-
-        const response = executeRequest(
-          {
-            method: req.method,
-            url,
-            headers: req.headers || {},
-            body,
-          },
-          config
-        );
-
+        const response = executeRequest({ method: req.method, url, headers: req.headers || {}, body }, cfg);
         const result = req.assertions ? runAssertions(response, req.assertions) : { passed: true, results: [] };
-
         summary.total++;
-        if (result.passed) {
-          summary.passed++;
-        } else {
-          summary.failed++;
-        }
-
-        summary.results.push({
-          name: req.name,
-          status: response.status,
-          passed: result.passed,
-          assertions: result.results,
-        });
+        if (result.passed) summary.passed++; else summary.failed++;
+        summary.results.push({ name: req.name, status: response.status, passed: result.passed, assertions: result.results });
       }
-
       return summary;
     },
-  };
+  });
 
-  settings.tools.api_mock = {
-    description: 'Generate a mock response from JSON schema',
-    parameters: z.object({
-      schema: z.string().describe('JSON schema string'),
-    }),
+  ctx.tools.register({
+    name: 'api_mock',
+    description: '生成 Mock 数据',
+    parameters: z.object({ schema: z.string() }),
     execute: async (params: any) => {
-      const schema = JSON.parse(params.schema);
-      const mock = generateMock(schema);
-      return { mock };
+      return { mock: generateMock(JSON.parse(params.schema)) };
     },
-  };
+  });
 
-  settings.commands.api = {
-    description: 'API testing command',
-    execute: async (args: string[]) => {
-      const subcommand = args[0];
-
-      switch (subcommand) {
-        case 'get': {
-          const url = args[1];
-          if (!url) return 'Usage: /api get <url>';
-          const response = executeRequest({ method: 'GET', url }, config);
-          return formatResponseForDisplay(response);
-        }
-
-        case 'post': {
-          const url = args[1];
-          const body = args[2];
-          if (!url) return 'Usage: /api post <url> [body]';
-          const response = executeRequest({ method: 'POST', url, body }, config);
-          return formatResponseForDisplay(response);
-        }
-
-        case 'test': {
-          const url = args[1];
-          const assertionsStr = args[2];
-          if (!url || !assertionsStr) return 'Usage: /api test <url> <assertions-json>';
-          const response = executeRequest({ method: 'GET', url }, config);
-          const assertions: Assertion[] = JSON.parse(assertionsStr);
-          const result = runAssertions(response, assertions);
-          return JSON.stringify(result, null, 2);
-        }
-
-        case 'mock': {
-          const schemaStr = args[1];
-          if (!schemaStr) return 'Usage: /api mock <schema-json>';
-          const schema = JSON.parse(schemaStr);
-          return JSON.stringify(generateMock(schema), null, 2);
-        }
-
-        default:
-          return 'Usage: /api <get|post|test|mock>';
+  ctx.commands.register({
+    name: 'api',
+    description: 'API 测试',
+    async execute(args: string) {
+      const parts = args.trim().split(/\s+/);
+      const sub = parts[0] || 'get';
+      if (sub === 'get') {
+        const response = executeRequest({ method: 'GET', url: parts[1] }, cfg);
+        return { content: formatResponseForDisplay(response) };
       }
+      if (sub === 'post') {
+        const response = executeRequest({ method: 'POST', url: parts[1], body: parts[2] }, cfg);
+        return { content: formatResponseForDisplay(response) };
+      }
+      return { content: '用法: /api get|post|test|mock <参数>' };
     },
-  };
+  });
+
+  ctx.settings.register({
+    title: 'api-tester',
+    description: 'API 测试客户端',
+    config: configSchema,
+  });
 }
 
 function generateMock(schema: any): any {
