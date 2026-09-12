@@ -1,325 +1,342 @@
 /**
- * dsh-api-tester — API测试客户端
- *
- * 功能：
- * 1. HTTP请求
- * 2. 断言测试
- * 3. 集合运行
- * 4. Mock数据
- *
- * 工具：api_request, api_test, api_collection_run, api_mock
- * 命令：/api
- * 配置：enabled
+ * API 测试插件：通过可注入 fetch 缝隙执行单次 HTTP 请求，并离线校验 API 测试集合为执行计划。
+ * @module @qingshanjiluo/dsh-api-tester
  */
-import { existsSync, readFileSync } from 'fs';
-import { execSync } from 'child_process';
-import { z } from 'zod';
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-export const name = 'dsh-api-tester';
-export const inject = ['settings', 'tools', 'commands'];
+export const name = 'dsh-api-tester'
+export const inject = ['tools']
 
-const configSchema = z.object({
-  enabled: z.boolean().default(true),
-  defaultTimeout: z.number().default(30000),
-  followRedirects: z.boolean().default(true),
-  verifySsl: z.boolean().default(true),
-});
-
-type Config = z.infer<typeof configSchema>;
-
-interface RequestOptions {
-  method: string;
-  url: string;
-  headers?: Record<string, string>;
-  body?: string;
-  timeout?: number;
+/** 部署配置。 */
+export interface Config {
+  /** 请求缺省超时（毫秒），当调用方传 timeoutMs<=0 时使用。 */
+  defaultTimeoutMs: number
+  /** 允许的最大超时（毫秒），超出会被钳制。 */
+  maxTimeoutMs: number
+  /** 响应正文写入工具输出的最大字符数，超出截断并置 truncated=true。 */
+  maxResponseBytes: number
 }
 
-interface Response {
-  status: number;
-  headers: Record<string, string>;
-  body: string;
-  timing: number;
+/** Schemastery 配置 schema。 */
+export const Config: z<Config> = z.object({
+  defaultTimeoutMs: z.number().default(30_000),
+  maxTimeoutMs: z.number().default(120_000),
+  maxResponseBytes: z.number().default(65_536),
+})
+
+/* ------------------------------------------------------------------ */
+/* 可注入缝隙（tests 喂假实现，绝不触网）                                */
+/* ------------------------------------------------------------------ */
+
+/** 经过校验、可直接发给 fetch 的请求。 */
+export interface PreparedRequest {
+  method: string
+  url: string
+  headers: Record<string, string>
+  body: string
+  timeoutMs: number
+  /** 调用方取消信号（来自 exec.signal），默认可缺省。 */
+  signal?: AbortSignal
 }
 
-interface Assertion {
-  type: string;
-  expected: any;
+/** 缝隙返回的最小响应形状（无需真实 Response 对象）。 */
+export interface RawResponse {
+  status: number
+  statusText: string
+  headers: Record<string, string>
+  body: string
 }
 
-function buildCurlCommand(options: RequestOptions, config: Config): string {
-  const parts: string[] = ['curl', '-s', '-w', '\\n%{http_code}\\n%{time_total}'];
+/** HTTP 执行缝隙。 */
+export type RunFn = (request: PreparedRequest) => Promise<RawResponse>
 
-  if (!config.verifySsl) {
-    parts.push('-k');
-  }
+/** 工具依赖缝隙集合。 */
+export interface ApiTesterDeps {
+  /** 覆盖 HTTP 执行（测试注入假响应）。 */
+  runFn?: RunFn
+  /** 覆盖时钟（测试固定 durationMs）。 */
+  now?: () => number
+}
 
-  if (config.followRedirects) {
-    parts.push('-L');
-  }
+const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 
-  parts.push('-X', options.method);
-  parts.push('--connect-timeout', String(Math.floor((options.timeout ?? config.defaultTimeout) / 1000)));
-
-  if (options.headers) {
-    for (const [key, value] of Object.entries(options.headers)) {
-      parts.push('-H', `'${key}: ${value}'`);
+/** 默认缝隙实现：Node 全局 fetch + AbortController 超时，并转发调用方取消。 */
+export const defaultRunFn: RunFn = async (request) => {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), request.timeoutMs)
+  const forwardAbort = () => controller.abort()
+  if (request.signal?.aborted) controller.abort()
+  else request.signal?.addEventListener('abort', forwardAbort, { once: true })
+  try {
+    const response = await fetch(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: request.body.length > 0 ? request.body : undefined,
+      redirect: 'follow',
+      signal: controller.signal,
+    })
+    const headers: Record<string, string> = {}
+    response.headers.forEach((value, key) => {
+      headers[key] = value
+    })
+    return {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+      body: await response.text(),
     }
-  }
-
-  if (options.body) {
-    parts.push('-d', `'${options.body.replace(/'/g, "'\\''")}'`);
-  }
-
-  parts.push(`'${options.url}'`);
-
-  return parts.join(' ');
-}
-
-export function executeRequest(options: RequestOptions, config: Config): Response {
-  const start = Date.now();
-  const command = buildCurlCommand(options, config);
-
-  try {
-    const output = execSync(command, {
-      timeout: options.timeout ?? config.defaultTimeout,
-      encoding: 'utf-8',
-      windowsHide: true,
-    });
-
-    const lines = output.trim().split('\n');
-    const status = parseInt(lines[lines.length - 2], 10);
-    const timing = parseFloat(lines[lines.length - 1]) * 1000;
-    const bodyLines = lines.slice(0, -2);
-    const body = bodyLines.join('\n');
-
-    return {
-      status,
-      headers: {},
-      body,
-      timing: timing || Date.now() - start,
-    };
-  } catch (error: any) {
-    const elapsed = Date.now() - start;
-    return {
-      status: 0,
-      headers: {},
-      body: error.message || 'Request failed',
-      timing: elapsed,
-    };
+  } finally {
+    clearTimeout(timer)
+    request.signal?.removeEventListener('abort', forwardAbort)
   }
 }
 
-export function parseResponse(response: string): any {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function normalizeHeaders(value: unknown): Record<string, string> | string {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) return 'headers must be a JSON object of string keys to string values'
+  const out: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof raw !== 'string') return `headers["${key}"] must be a string`
+    out[key] = raw
+  }
+  return out
+}
+
+function isValidHttpUrl(url: unknown): url is string {
+  if (typeof url !== 'string' || url.length === 0) return false
   try {
-    return JSON.parse(response);
+    const parsed = new URL(url)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
   } catch {
-    return response;
+    return false
   }
 }
 
-export function applyVariables(template: string, variables: Record<string, string>): string {
-  let result = template;
-  for (const [key, value] of Object.entries(variables)) {
-    result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
+function errorMessage(error: unknown, callerSignal?: AbortSignal): string {
+  if (callerSignal?.aborted) return 'request aborted by caller'
+  if (error instanceof Error) {
+    return error.name === 'AbortError' ? 'request aborted: timeout exceeded' : error.message
   }
-  return result;
+  return String(error)
 }
 
-export function runAssertions(response: Response, assertions: Assertion[]): { passed: boolean; results: any[] } {
-  const results: any[] = [];
+/* ------------------------------------------------------------------ */
+/* 工具工厂                                                            */
+/* ------------------------------------------------------------------ */
 
-  for (const assertion of assertions) {
-    let passed = false;
+/**
+ * 构建本插件的全部工具定义。
+ * @param config - 部署配置（超时/大小预算）。
+ * @param deps - 可注入缝隙（runFn / now），默认走 Node fetch 与 Date.now。
+ */
+export function createApiTesterTools(config: Config, deps: ApiTesterDeps = {}) {
+  const runFn = deps.runFn ?? defaultRunFn
+  const now = deps.now ?? (() => Date.now())
 
-    switch (assertion.type) {
-      case 'status_equals':
-        passed = response.status === assertion.expected;
-        break;
-      case 'body_contains':
-        passed = response.body.includes(assertion.expected);
-        break;
-      case 'json_path_equals': {
-        const data = parseResponse(response.body);
-        const parts = assertion.expected.path.split('.');
-        let value: any = data;
-        for (const part of parts) {
-          if (value && typeof value === 'object') {
-            value = value[part];
+  const apiRequest = defineTool({
+    name: 'api_request',
+    description:
+      'Perform exactly one HTTP request and return the response. Call with method (GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS, case-insensitive), url (absolute http(s) URL), headers (JSON object mapping header names to string values, pass {} if none), body (request payload string, pass "" if none) and timeoutMs (milliseconds; 0 uses the plugin default). Returns the status line, response headers as "Name: value" lines, and the body text (truncated to the configured budget, flagged by truncated).',
+    parameters: {
+      method: { type: 'string', required: true, description: 'HTTP method, one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS.' },
+      url: { type: 'string', required: true, description: 'Absolute http:// or https:// URL to request.' },
+      headers: { type: 'json', required: true, description: 'JSON object of header name to header value (both strings); pass {} when there are no headers.' },
+      body: { type: 'string', required: true, description: 'Request body text; pass an empty string when there is no body.' },
+      timeoutMs: { type: 'number', required: true, description: 'Abort the request after this many milliseconds; 0 means use the plugin default timeout.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'True when the request completed with a 2xx/3xx status; false on transport failure, timeout, validation error or 4xx/5xx.' },
+          status: { type: 'number', required: true, description: 'HTTP status code, or 0 when no response was received.' },
+          statusText: { type: 'string', required: true, description: 'HTTP status text from the response; empty when no response.' },
+          headers: { type: 'array', required: true, description: 'Response headers as "Name: value" lines.', items: { type: 'string' } },
+          bodyText: { type: 'string', required: true, description: 'Response body text, truncated to the configured budget when needed.' },
+          truncated: { type: 'boolean', required: true, description: 'True when bodyText was cut off by the size budget.' },
+          durationMs: { type: 'number', required: true, description: 'Wall-clock duration of the attempt in milliseconds.' },
+          error: { type: 'string', required: true, description: 'Failure reason (validation, timeout or transport); empty string when none.' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.ok
+          ? `HTTP ${value.status} ${value.statusText} (${value.durationMs}ms)\n${value.bodyText}`
+          : `api_request failed: ${value.error || `HTTP ${value.status} ${value.statusText}`} (${value.durationMs}ms)\n${value.bodyText}`.trimEnd(),
+      }],
+    },
+    timeoutMs: config.maxTimeoutMs + 5_000,
+    async execute(args, exec) {
+      const method = typeof args.method === 'string' ? args.method.trim().toUpperCase() : ''
+      if (!ALLOWED_METHODS.has(method)) {
+        return { ok: false, status: 0, statusText: '', headers: [], bodyText: '', truncated: false, durationMs: 0, error: `method "${args.method}" is not one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS` }
+      }
+      if (!isValidHttpUrl(args.url)) {
+        return { ok: false, status: 0, statusText: '', headers: [], bodyText: '', truncated: false, durationMs: 0, error: `url must be an absolute http(s) URL, got "${String(args.url)}"` }
+      }
+      const headers = normalizeHeaders(args.headers)
+      if (typeof headers === 'string') {
+        return { ok: false, status: 0, statusText: '', headers: [], bodyText: '', truncated: false, durationMs: 0, error: headers }
+      }
+      const body = typeof args.body === 'string' ? args.body : ''
+      const requested = typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : config.defaultTimeoutMs
+      const timeoutMs = Math.min(requested, config.maxTimeoutMs)
+
+      const startedAt = now()
+      const signal = exec?.signal
+      try {
+        const response = await runFn({ method, url: args.url, headers, body, timeoutMs, signal })
+        const durationMs = Math.max(0, now() - startedAt)
+        const rawBody = typeof response.body === 'string' ? response.body : ''
+        const truncated = rawBody.length > config.maxResponseBytes
+        const bodyText = truncated ? rawBody.slice(0, config.maxResponseBytes) : rawBody
+        const headerLines = Object.entries(response.headers ?? {}).map(([key, value]) => `${key}: ${value}`)
+        const ok = response.status >= 200 && response.status < 400
+        return {
+          ok,
+          status: response.status,
+          statusText: response.statusText ?? '',
+          headers: headerLines,
+          bodyText,
+          truncated,
+          durationMs,
+          error: ok ? '' : `server responded with status ${response.status}`,
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          status: 0,
+          statusText: '',
+          headers: [],
+          bodyText: '',
+          truncated: false,
+          durationMs: Math.max(0, now() - startedAt),
+          error: errorMessage(error, signal),
+        }
+      }
+    },
+  })
+
+  const apiCollectionPlan = defineTool({
+    name: 'api_collection_plan',
+    description:
+      'Validate an API collection JSON document offline (no network calls) and return a normalized execution plan. The collection must be an object shaped { name: string, requests: [{ name?: string, method: string, url: string, body?: string, timeoutMs?: number }] } with at least one request. Each request needs a supported HTTP method and an absolute http(s) URL. Returns ok, per-entry errors with request indexes, and the normalized steps list you would then run one-by-one with api_request.',
+    parameters: {
+      collection: { type: 'json', required: true, description: 'The collection JSON document: { name, requests: [{ name?, method, url, body?, timeoutMs? }] }.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'True when the collection validated without errors and the plan is runnable.' },
+          collectionName: { type: 'string', required: true, description: 'Normalized collection name ("Untitled Collection" when missing or blank).' },
+          errors: { type: 'array', required: true, description: 'Validation errors prefixed with the request index; empty when ok.', items: { type: 'string' } },
+          steps: {
+            type: 'array',
+            required: true,
+            description: 'Normalized executable steps for the valid requests, in collection order.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                index: { type: 'number', required: true, description: 'Zero-based position of the request inside collection.requests.' },
+                name: { type: 'string', required: true, description: 'Step name ("Request N" when the entry omitted it).' },
+                method: { type: 'string', required: true, description: 'Uppercased HTTP method.' },
+                url: { type: 'string', required: true, description: 'Absolute http(s) URL.' },
+                timeoutMs: { type: 'number', required: true, description: 'Effective timeout: entry value clamped to the plugin maximum, or the plugin default.' },
+                hasBody: { type: 'boolean', required: true, description: 'True when the entry carried a non-empty body string.' },
+              },
+            },
+          },
+          count: { type: 'number', required: true, description: 'Number of executable steps in the plan.' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.ok
+          ? `collection "${value.collectionName}" ok — ${value.count} step(s) planned`
+          : `collection "${value.collectionName}" invalid:\n${value.errors.join('\n')}`,
+      }],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const errors: string[] = []
+      const collection = args.collection as unknown
+      if (!isPlainObject(collection)) {
+        return { ok: false, collectionName: 'Untitled Collection', errors: ['collection must be a JSON object'], steps: [], count: 0 }
+      }
+      const rawName = collection.name
+      const collectionName = typeof rawName === 'string' && rawName.trim().length > 0 ? rawName.trim() : 'Untitled Collection'
+
+      const requests = collection.requests
+      if (!Array.isArray(requests)) {
+        errors.push('collection.requests must be an array')
+        return { ok: false, collectionName, errors, steps: [], count: 0 }
+      }
+      if (requests.length === 0) {
+        errors.push('collection.requests must contain at least one request')
+      }
+
+      type Step = { index: number; name: string; method: string; url: string; timeoutMs: number; hasBody: boolean }
+      const steps: Step[] = []
+      requests.forEach((entry, index) => {
+        let entryOk = true
+        if (!isPlainObject(entry)) {
+          errors.push(`requests[${index}]: must be an object`)
+          return
+        }
+        const method = typeof entry.method === 'string' ? entry.method.trim().toUpperCase() : ''
+        if (!ALLOWED_METHODS.has(method)) {
+          errors.push(`requests[${index}]: method "${String(entry.method)}" is not one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS`)
+          entryOk = false
+        }
+        if (!isValidHttpUrl(entry.url)) {
+          errors.push(`requests[${index}]: url must be an absolute http(s) URL, got "${String(entry.url)}"`)
+          entryOk = false
+        }
+        let timeoutMs = config.defaultTimeoutMs
+        if (entry.timeoutMs !== undefined) {
+          if (typeof entry.timeoutMs !== 'number' || !Number.isFinite(entry.timeoutMs) || entry.timeoutMs <= 0) {
+            errors.push(`requests[${index}]: timeoutMs must be a positive number of milliseconds`)
+            entryOk = false
           } else {
-            value = undefined;
-            break;
+            timeoutMs = Math.min(entry.timeoutMs, config.maxTimeoutMs)
           }
         }
-        passed = value === assertion.expected.value;
-        break;
-      }
-      case 'response_time_less_than':
-        passed = response.timing < assertion.expected;
-        break;
-    }
+        if (!entryOk) return
+        const rawNameValue = entry.name
+        steps.push({
+          index,
+          name: typeof rawNameValue === 'string' && rawNameValue.trim().length > 0 ? rawNameValue.trim() : `Request ${index + 1}`,
+          method,
+          url: entry.url as string,
+          timeoutMs,
+          hasBody: typeof entry.body === 'string' && entry.body.length > 0,
+        })
+      })
 
-    results.push({ type: assertion.type, passed });
-  }
+      return { ok: errors.length === 0, collectionName, errors, steps, count: steps.length }
+    },
+  })
 
-  return {
-    passed: results.every((r) => r.passed),
-    results,
-  };
+  return [apiRequest, apiCollectionPlan]
 }
 
-export function formatRequestForDisplay(request: RequestOptions): string {
-  return buildCurlCommand(request, {
-    enabled: true,
-    defaultTimeout: 30000,
-    followRedirects: true,
-    verifySsl: true,
-  });
-}
-
-export function formatResponseForDisplay(response: Response): string {
-  const preview = response.body.length > 200 ? response.body.substring(0, 200) + '...' : response.body;
-  return `Status: ${response.status}\nTime: ${response.timing.toFixed(0)}ms\nBody:\n${preview}`;
-}
-
-export function apply(ctx: any, config?: Config) {
-  const cfg = config || configSchema.parse({});
-
-  ctx.tools.register({
-    name: 'api_request',
-    description: '发送 HTTP 请求',
-    parameters: z.object({
-      method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
-      url: z.string(),
-      headers: z.string().optional(),
-      body: z.string().optional(),
-      timeout: z.number().optional(),
-    }),
-    execute: async (params: any) => {
-      const headers = params.headers ? JSON.parse(params.headers) : {};
-      const response = executeRequest({
-        method: params.method,
-        url: params.url,
-        headers,
-        body: params.body,
-        timeout: params.timeout,
-      }, cfg);
-
-      return {
-        status: response.status,
-        body: response.body,
-        headers: response.headers,
-        timing: `${response.timing.toFixed(0)}ms`,
-      };
-    },
-  });
-
-  ctx.tools.register({
-    name: 'api_test',
-    description: '发送请求并运行断言',
-    parameters: z.object({
-      method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
-      url: z.string(),
-      headers: z.string().optional(),
-      body: z.string().optional(),
-      assertions: z.string(),
-    }),
-    execute: async (params: any) => {
-      const headers = params.headers ? JSON.parse(params.headers) : {};
-      const assertions: Assertion[] = JSON.parse(params.assertions);
-      const response = executeRequest({ method: params.method, url: params.url, headers, body: params.body }, cfg);
-      const result = runAssertions(response, assertions);
-      return { passed: result.passed, results: result.results, response: formatResponseForDisplay(response) };
-    },
-  });
-
-  ctx.tools.register({
-    name: 'api_collection_run',
-    description: '运行请求集合',
-    parameters: z.object({
-      file: z.string(),
-      env: z.string().optional(),
-    }),
-    execute: async (params: any) => {
-      if (!existsSync(params.file)) return { error: `文件不存在: ${params.file}` };
-      const content = readFileSync(params.file, 'utf-8');
-      const collection = JSON.parse(content);
-      const env = params.env ? JSON.parse(params.env) : {};
-      const summary = { total: 0, passed: 0, failed: 0, results: [] as any[] };
-      for (const req of collection.requests) {
-        const url = applyVariables(req.url, env);
-        const body = req.body ? applyVariables(req.body, env) : undefined;
-        const response = executeRequest({ method: req.method, url, headers: req.headers || {}, body }, cfg);
-        const result = req.assertions ? runAssertions(response, req.assertions) : { passed: true, results: [] };
-        summary.total++;
-        if (result.passed) summary.passed++; else summary.failed++;
-        summary.results.push({ name: req.name, status: response.status, passed: result.passed, assertions: result.results });
-      }
-      return summary;
-    },
-  });
-
-  ctx.tools.register({
-    name: 'api_mock',
-    description: '生成 Mock 数据',
-    parameters: z.object({ schema: z.string() }),
-    execute: async (params: any) => {
-      return { mock: generateMock(JSON.parse(params.schema)) };
-    },
-  });
-
-  ctx.commands.register({
-    name: 'api',
-    description: 'API 测试',
-    async execute(args: string) {
-      const parts = args.trim().split(/\s+/);
-      const sub = parts[0] || 'get';
-      if (sub === 'get') {
-        const response = executeRequest({ method: 'GET', url: parts[1] }, cfg);
-        return { content: formatResponseForDisplay(response) };
-      }
-      if (sub === 'post') {
-        const response = executeRequest({ method: 'POST', url: parts[1], body: parts[2] }, cfg);
-        return { content: formatResponseForDisplay(response) };
-      }
-      return { content: '用法: /api get|post|test|mock <参数>' };
-    },
-  });
-
-  ctx.settings.register({
-    title: 'api-tester',
-    description: 'API 测试客户端',
-    config: configSchema,
-  });
-}
-
-function generateMock(schema: any): any {
-  if (schema.type === 'object' && schema.properties) {
-    const result: Record<string, any> = {};
-    for (const [key, value] of Object.entries<any>(schema.properties)) {
-      result[key] = generateMock(value);
-    }
-    return result;
-  }
-
-  if (schema.type === 'array' && schema.items) {
-    return [generateMock(schema.items)];
-  }
-
-  switch (schema.type) {
-    case 'string':
-      if (schema.enum) return schema.enum[0];
-      if (schema.format === 'email') return 'test@example.com';
-      if (schema.format === 'date') return '2026-01-01';
-      if (schema.format === 'date-time') return '2026-01-01T00:00:00Z';
-      return schema.example || 'string';
-    case 'number':
-    case 'integer':
-      if (schema.enum) return schema.enum[0];
-      return schema.example ?? 0;
-    case 'boolean':
-      return schema.example ?? false;
-    default:
-      return null;
+/**
+ * 注册工具。
+ * @param ctx - 携带 ctx.tools 的注册上下文。
+ * @param config - 部署显式配置。
+ */
+export function apply(ctx: Context, config: Config): void {
+  for (const tool of createApiTesterTools(config)) {
+    ctx.tools.register(tool)
   }
 }

@@ -1,48 +1,40 @@
 # dsh-api-tester
 
-> DeepSeek Harness API 测试客户端
+DeepSeek Harness 插件：单次 HTTP 请求执行 + API 测试集合离线校验。所有 HTTP 走可注入的 fetch 缝隙（默认 Node 全局 fetch），测试与工具内部逻辑不触网。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-## ✨ 功能特性
-
-- 🚀 **HTTP 请求**: 支持 GET/POST/PUT/PATCH/DELETE，自定义 headers/body
-- ✅ **断言测试**: 状态码、响应体、JSON Path、响应时间断言
-- 📦 **集合运行**: 批量执行请求集合，统计通过率
-- 🎭 **Mock 数据**: 从 JSON Schema 生成 mock 数据
-- 🔧 **变量替换**: 支持 `{{variable}}` 模板变量
-
-## 📦 安装
+## 安装
 
 ```bash
-npm install dsh-api-tester
+npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-api-tester
 ```
 
-## 🛠️ 工具
+## 工具
 
-| 工具名 | 描述 | 参数 |
-|--------|------|------|
-| `api_request` | 发送 HTTP 请求 | `method`, `url`, `headers`, `body` |
-| `api_test` | 发送请求并运行断言 | `method`, `url`, `assertions` |
-| `api_collection_run` | 运行请求集合 | `file`, `env` |
-| `api_mock` | 生成 mock 数据 | `schema` |
+| 工具名 | 描述 |
+|--------|------|
+| `api_request` | 执行恰好一次 HTTP 请求（method / url / headers / body / timeoutMs），返回状态、响应头、正文（超出预算截断并标记 `truncated`）。请求超时钳制到 `maxTimeoutMs`，并转发调用方取消信号。 |
+| `api_collection_plan` | 离线校验 API 集合 JSON（`{ name, requests: [{ name?, method, url, body?, timeoutMs? }] }`），逐条给出带索引的错误信息，并输出归一化后的可执行步骤计划（不发起任何网络请求）。 |
 
-## 📋 命令
-
-- `/api get <url>` — GET 请求
-- `/api post <url> <body>` — POST 请求
-- `/api test <url> <assertions>` — 测试请求
-- `/api mock <schema>` — 生成 mock
-
-## ⚙️ 配置
+## 配置
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `enabled` | boolean | `true` | 启用插件 |
-| `defaultTimeout` | number | `30000` | 请求超时(ms) |
-| `followRedirects` | boolean | `true` | 跟随重定向 |
-| `verifySsl` | boolean | `true` | 验证 SSL |
+| `defaultTimeoutMs` | number | `30000` | 请求缺省超时（毫秒），调用方传 `timeoutMs <= 0` 时使用 |
+| `maxTimeoutMs` | number | `120000` | 允许的最大超时，超出会被钳制 |
+| `maxResponseBytes` | number | `65536` | 响应正文写入工具输出的最大字符数，超出截断 |
 
-## 📄 License
+## 开发
+
+```bash
+npm install
+npx tsc --noEmit
+npm run build
+npx vitest run
+node scripts/load-smoke.mjs
+```
+
+HTTP 执行与时钟均为可注入缝隙（`createApiTesterTools(config, { runFn, now })`），单元测试喂假响应，零网络、零子进程。
+
+## License
 
 MIT

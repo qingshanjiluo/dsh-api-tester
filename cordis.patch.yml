@@ -1,5 +1,7 @@
 - insert:
-    - id: api-tester
-      name: dsh-api-tester
+    - id: dsh-api-tester
+      name: '@qingshanjiluo/dsh-api-tester'
       config:
-        enabled: true
+        defaultTimeoutMs: 30000
+        maxTimeoutMs: 120000
+        maxResponseBytes: 65536
